@@ -45,7 +45,6 @@ public class GridStrategyEngine {
 
     @PostConstruct
     public void init() {
-        // 从数据库加载状态，如果没有则创建
         state = portfolioRepository.findById("MAIN").orElseGet(() -> {
             PortfolioState newState = new PortfolioState();
             return portfolioRepository.save(newState);
@@ -81,7 +80,7 @@ public class GridStrategyEngine {
             buyGrids.add(currentPrice.subtract(currentPrice.multiply(BigDecimal.valueOf(baseStep * i))));
             sellGrids.add(currentPrice.add(currentPrice.multiply(BigDecimal.valueOf(baseStep * i))));
         }
-        log.info("网格重组 [DB已同步]：中心={}, 步长={}, 波动率={}", currentPrice, baseStep, currentVolatility);
+        log.info("网格重组 [DB同步]：中心={}, 步长={}, 波动率={}", currentPrice, baseStep, currentVolatility);
     }
 
     private void checkRiskStatus() {
@@ -119,8 +118,7 @@ public class GridStrategyEngine {
             state.setBalanceBtc(state.getBalanceBtc() + amount);
             saveAndRecord("合约开多", price, amount);
         } else if ("SELL".equals(type) && state.getBalanceBtc() > 0) {
-            double amountToSell = state.getBalanceBtc() / (double) Math.max(1, sellGrids.size());
-            // 简化合约盈亏计算
+            double amountToSell = state.getBalanceBtc() / 5.0;
             double pnl = (price.doubleValue() - lastGridCenter.doubleValue()) * amountToSell * leverage;
             state.setBalanceUsdt(state.getBalanceUsdt() + margin + pnl);
             state.setBalanceBtc(state.getBalanceBtc() - amountToSell);
@@ -129,10 +127,7 @@ public class GridStrategyEngine {
     }
 
     private void saveAndRecord(String action, BigDecimal price, double amount) {
-        // 1. 保存持仓状态到数据库
         portfolioRepository.save(state);
-
-        // 2. 写入成交记录到数据库
         TradeRecord record = new TradeRecord();
         record.setType(action);
         record.setPrice(price);
@@ -140,8 +135,7 @@ public class GridStrategyEngine {
         record.setBalanceUsdtAfter(state.getBalanceUsdt());
         record.setTimestamp(LocalDateTime.now());
         tradeRepository.save(record);
-
-        log.info("DB成交同步: {} @ {}, 余额: {} USDT", action, price, state.getBalanceUsdt());
+        log.info("DB持久化成交: {} @ {}, 余额: {} USDT", action, price, state.getBalanceUsdt());
     }
 
     public Map<String, Object> getPortfolioSnapshot() {
@@ -153,13 +147,12 @@ public class GridStrategyEngine {
         map.put("btc", String.format("%.6f", state.getBalanceBtc()));
         map.put("pnl", String.format("%.2f%%", (total - state.getInitialInvestment())));
         
-        // 从数据库获取最后 5 条记录
-        List<String> lastTrades = tradeRepository.findAll().stream()
+        List<String> trades = tradeRepository.findAll().stream()
                 .sorted((a, b) -> b.getTimestamp().compareTo(a.getTimestamp()))
                 .limit(5)
                 .map(r -> String.format("%s @ %s (%s)", r.getType(), r.getPrice(), r.getTimestamp()))
                 .collect(Collectors.toList());
-        map.put("lastTrades", lastTrades);
+        map.put("lastTrades", trades);
         return map;
     }
 }
