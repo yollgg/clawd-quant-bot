@@ -1,23 +1,39 @@
 package bot.quant.grid;
 
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 import org.springframework.stereotype.Service;
-import java.util.Random;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Service
 public class SentimentService {
-    
-    /**
-     * 模拟舆论分析逻辑
-     * 返回 0.0 到 1.0 的情感波动分。
-     * 低于 0.3 代表舆论平稳，适合网格策略。
-     */
-    public double getSentimentVolatility() {
-        // 实际开发中会抓取 Twitter/News API 进行 NLP 分析
-        // 这里模拟一个平稳的市场状态
-        return 0.15 + (new Random().nextDouble() * 0.1); 
-    }
+    private static final Logger log = LoggerFactory.getLogger(SentimentService.class);
+    private final OkHttpClient client = new OkHttpClient();
+    private final ObjectMapper mapper = new ObjectMapper();
 
-    public boolean isMarketCalm() {
-        return getSentimentVolatility() < 0.35;
+    /**
+     * 对接外部真实舆情 API (Fear & Greed Index)
+     * 同时也预留了 AI 情感分析接口
+     */
+    public double getFearAndGreedScore() {
+        Request request = new Request.Builder()
+                .url("https://api.alternative.me/fng/")
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            if (response.isSuccessful() && response.body() != null) {
+                JsonNode root = mapper.readTree(response.body().string());
+                int value = root.get("data").get(0).get("value").asInt();
+                log.info("实时恐惧贪婪指数: {}", value);
+                return value / 100.0; // 归一化为 0.0 - 1.0
+            }
+        } catch (Exception e) {
+            log.error("舆情采集异常: {}", e.getMessage());
+        }
+        return 0.5; // 默认中性
     }
 }

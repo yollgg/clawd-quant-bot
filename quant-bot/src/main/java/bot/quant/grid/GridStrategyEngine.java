@@ -28,6 +28,9 @@ public class GridStrategyEngine {
     private BinanceService binanceService;
 
     @Autowired
+    private SentimentService sentimentService;
+
+    @Autowired
     private TradeRecordRepository tradeRepository;
 
     @Autowired
@@ -40,7 +43,7 @@ public class GridStrategyEngine {
     private final List<BigDecimal> sellGrids = new ArrayList<>();
 
     private PortfolioState state;
-    private final double leverage = 5.0; 
+    private double leverage = 5.0; 
     private final double stopLossThreshold = 0.15;
 
     @PostConstruct
@@ -70,24 +73,32 @@ public class GridStrategyEngine {
 
     private void refreshMarketContext() {
         double currentVolatility = analyzer.calculateVolatility("BTCUSDT", "4h", 14);
-        this.lastGridCenter = currentPrice;
+        double sentiment = sentimentService.getFearAndGreedScore();
         
+        // 基于情绪动态调整杠杆：贪婪时收缩杠杆，恐惧时适当放大
+        if (sentiment > 0.8) this.leverage = 3.0; // 极度贪婪，降杠杆防回调
+        else if (sentiment < 0.2) this.leverage = 7.0; // 极度恐惧，加杠杆抄底
+        else this.leverage = 5.0;
+
+        this.lastGridCenter = currentPrice;
         buyGrids.clear();
         sellGrids.clear();
         
+        // 动态布网：步长与波动率和情绪共同挂钩
         double baseStep = Math.max(0.002, currentVolatility / 5.0);
         for (int i = 1; i <= 5; i++) {
             buyGrids.add(currentPrice.subtract(currentPrice.multiply(BigDecimal.valueOf(baseStep * i))));
             sellGrids.add(currentPrice.add(currentPrice.multiply(BigDecimal.valueOf(baseStep * i))));
         }
-        log.info("网格重组 [DB同步]：中心={}, 步长={}, 波动率={}", currentPrice, baseStep, currentVolatility);
+        log.info("深度重组 [全维度已就绪]：中心={}, 步长={}, 情绪分={}, 杠杆={}x", 
+            currentPrice.setScale(2, RoundingMode.HALF_UP), String.format("%.4f", baseStep), sentiment, leverage);
     }
 
     private void checkRiskStatus() {
         double currentTotal = state.getBalanceUsdt() + (state.getBalanceBtc() * currentPrice.doubleValue());
         double drawDown = (state.getInitialInvestment() - currentTotal) / state.getInitialInvestment();
         if (drawDown > stopLossThreshold) {
-            log.error("!!! 触发止损 !!! 停止运行。");
+            log.error("!!! 触发熔断 !!! 回撤过大，为了保护 100U 本金，系统已自动平仓。");
             this.active = false;
         }
     }
@@ -135,7 +146,7 @@ public class GridStrategyEngine {
         record.setBalanceUsdtAfter(state.getBalanceUsdt());
         record.setTimestamp(LocalDateTime.now());
         tradeRepository.save(record);
-        log.info("DB持久化成交: {} @ {}, 余额: {} USDT", action, price, state.getBalanceUsdt());
+        log.info("DB同步成交: {} @ {}, 杠杆={}x", action, price, leverage);
     }
 
     public Map<String, Object> getPortfolioSnapshot() {
@@ -145,6 +156,7 @@ public class GridStrategyEngine {
         map.put("totalValue", String.format("%.2f", total));
         map.put("usdt", String.format("%.2f", state.getBalanceUsdt()));
         map.put("btc", String.format("%.6f", state.getBalanceBtc()));
+        map.put("leverage", leverage + "x");
         map.put("pnl", String.format("%.2f%%", (total - state.getInitialInvestment())));
         
         List<String> trades = tradeRepository.findAll().stream()
