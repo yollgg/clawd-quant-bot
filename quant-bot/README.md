@@ -1,48 +1,32 @@
 # 🤖 Crypto Quant Grid Bot (Spring Boot)
 
-这是一个基于 Spring Boot 3.4 构建的虚拟货币量化交易系统（模拟仓版）。它集成了**智能舆论分析**引导下的**自适应做多网格策略**，并配有**实时 Telegram 成交通知**。
+这是一个基于 Spring Boot 3.4 构建的虚拟货币量化交易系统（100U 合约模拟版）。它集成了**智能波动率分析**引导下的**自适应做多网格策略**，并配有**实时 Telegram 成交通知**。
 
 ## 🌟 核心特性
 
 - **Spring Boot 架构**: 高效的定时任务驱动 (`@Scheduled`)。
-- **自适应网格 (Auto Re-align)**: 每 5 秒监测市价，当价格偏离网格中心 > 2% 时，自动重新对齐网格，防止踏空。
-- **做多网格策略 (Grid Long)**: 针对上升/震荡趋势优化，初始持仓 50%，分批低买高卖。
-- **实时监控推送**: 独立的 Node.js 脚本实时监听成交 API，秒级推送到 Telegram。
-- **模拟仓系统**: 无需 API Key 即可进行压力测试和策略验证。
+- **100U 合约模式**: 模拟 5x 杠杆、保证金制度及爆仓止损逻辑。
+- **自适应波动率 (Volatility-Aware)**: 基于币安 4H K线计算 ATR，动态调整网格间距。
+- **实时监控推送**: 独立的 Node.js 脚本秒级推送到 Telegram。
+- **每小时自动化报表**: 定时推送资产、持仓及挂单快照。
 
 ## 📂 项目结构
 
 - `src/main/java/bot/quant/grid/`
-    - `GridStrategyEngine`: 策略核心逻辑。
-    - `PortfolioController`: 持仓与成交历史 API。
-    - `SentimentService`: 舆论与波动率分析（Mock）。
-- `docs/`
-    - `PLAN.md`: 项目设计蓝图。
-    - `EXECUTION.md`: 执行与逻辑细节。
+    - `GridStrategyEngine`: 策略核心（含杠杆与金字塔逻辑）。
+    - `MarketAnalyzer`: 4H 波动率与资金流向分析模块。
+    - `BinanceService`: 实时行情采集。
+    - `PortfolioController`: 持仓数据接口。
+- `docs/`: 详细的计划与执行文档。
 - `quant-bot-monitor.js`: Telegram 推送守护进程。
 
-## 🚀 快速开始
+## 🤖 多智能体协作路线图 (Sub-Agents)
 
-### 1. 启动量化引擎 (Java)
-```bash
-cd quant-bot
-mvn spring-boot:run
-```
+本系统支持通过召唤专门的智能体来异步完善：
 
-### 2. 启动 Telegram 监控 (Node)
-```bash
-node quant-bot-monitor.js
-```
-
-### 3. 查看实时持仓
-```bash
-curl http://localhost:8080/portfolio
-```
-
-## 📊 当前运行状态 (2026-01-28)
-- **初始投入**: 10,000 USDT
-- **当前仓位**: 50% BTC + 50% USDT (进可攻退可守)
-- **自动化状态**: 已开启全自动对齐与成交推送。
+1. **`analyst-agent` (行情分析员)**: 负责 24/7 监控社交媒体与宏观数据，向引擎推送风险评分。
+2. **`dev-agent` (架构师)**: 负责将 H2 内存库升级为实体数据库，并完善 Web 控制面板。
+3. **`tester-agent` (测试员)**: 负责进行蒙特卡洛模拟，寻找当前行情下的最优网格参数。
 
 ---
 *Powered by Clawdbot Agent*
