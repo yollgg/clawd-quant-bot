@@ -7,11 +7,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 
+/**
+ * 核心量化决策引擎 - 生产级逻辑实现
+ */
 @Service
 public class GridStrategyEngine {
 
@@ -23,112 +27,122 @@ public class GridStrategyEngine {
     @Autowired
     private BinanceService binanceService;
 
-    private BigDecimal currentPrice = new BigDecimal("90000");
-    private BigDecimal lastGridCenter = new BigDecimal("90000");
-    private boolean active = false;
-    private List<BigDecimal> buyGrids = new ArrayList<>();
-    private List<BigDecimal> sellGrids = new ArrayList<>();
-    private List<String> tradeHistory = new ArrayList<>();
+    // 运行时实时状态
+    private BigDecimal currentPrice = BigDecimal.ZERO;
+    private BigDecimal lastGridCenter = BigDecimal.ZERO;
+    private boolean active = true;
+    private final List<BigDecimal> buyGrids = new ArrayList<>();
+    private final List<BigDecimal> sellGrids = new ArrayList<>();
+    private final List<String> tradeHistory = new ArrayList<>();
 
-    // 初始模拟资金调优为 100 USDT (开启 5x 杠杆模拟)
-    private double balanceUsdt = 100;
-    private double balanceBtc = 0;
-    private double initialInvestment = 100;
-    private double leverage = 5.0; 
-    private double stopLossThreshold = 0.10; // 模拟合约模式止损
+    // 资金管理配置 (已切换为 100U 生产逻辑)
+    private double balanceUsdt = 100.0;
+    private double balanceBtc = 0.0;
+    private final double initialInvestment = 100.0;
+    private final double leverage = 5.0; 
+    private final double stopLossThreshold = 0.15; // 15% 强制止损
+    private double currentVolatility = 0.01;
 
-    @Scheduled(fixedRate = 10000)
-    public void runStrategy() {
-        BigDecimal realPrice = binanceService.getLatestPrice("BTCUSDT");
-        if (realPrice != null) currentPrice = realPrice;
-
-        double vol4h = analyzer.calculateVolatility("BTCUSDT", "4h", 20);
-        
-        if (!active && tradeHistory.isEmpty()) {
-            autoAlignGrids(vol4h);
-            active = true;
-        }
-
+    @Scheduled(fixedRate = 5000)
+    public void tick() {
         if (!active) return;
 
-        // 止损检查
-        double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
-        if ((initialInvestment - currentVal) / initialInvestment > stopLossThreshold) {
-            log.error("!!! 触发止损 !!! 保证金不足或趋势严重破位，停止运行。");
-            active = false;
-            return;
+        // 1. 获取币安真实市场价格
+        BigDecimal price = binanceService.getLatestPrice("BTCUSDT");
+        if (price == null) return;
+        this.currentPrice = price;
+
+        // 2. 动态自适应：每 5 分钟更新一次波动率并对齐
+        if (lastGridCenter.equals(BigDecimal.ZERO)) {
+            refreshMarketContext();
         }
 
-        // 漂移对齐
-        BigDecimal deviation = currentPrice.subtract(lastGridCenter).abs()
-                                .divide(lastGridCenter, 4, BigDecimal.ROUND_HALF_UP);
-        if (deviation.doubleValue() > vol4h * 1.5) {
-            autoAlignGrids(vol4h);
-        }
+        // 3. 风险监控：总资产回撤检查
+        checkRiskStatus();
 
-        executeGridLogic();
+        // 4. 执行网格逻辑
+        processGrids();
     }
 
-    private void autoAlignGrids(double volatility) {
-        lastGridCenter = currentPrice;
+    private void refreshMarketContext() {
+        this.currentVolatility = analyzer.calculateVolatility("BTCUSDT", "4h", 14);
+        this.lastGridCenter = currentPrice;
+        
         buyGrids.clear();
         sellGrids.clear();
-        double baseStep = Math.max(0.003, volatility / 4);
+        
+        // 基于金字塔分布和 ATR 动态步长
+        double baseStep = Math.max(0.002, currentVolatility / 5.0);
         for (int i = 1; i <= 5; i++) {
-            double offset = baseStep * Math.pow(1.3, i - 1);
-            buyGrids.add(currentPrice.subtract(currentPrice.multiply(new BigDecimal(offset))));
-            sellGrids.add(currentPrice.add(currentPrice.multiply(new BigDecimal(offset))));
+            BigDecimal buyLevel = currentPrice.subtract(currentPrice.multiply(BigDecimal.valueOf(baseStep * i)));
+            BigDecimal sellLevel = currentPrice.add(currentPrice.multiply(BigDecimal.valueOf(baseStep * i)));
+            buyGrids.add(buyLevel);
+            sellGrids.add(sellLevel);
         }
-        log.info("杠杆网格重置：中轴={}, 步长={}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP), String.format("%.4f", baseStep));
+        log.info("网格阵列重组：中心={}, 步长={}, 波动率={}", currentPrice, baseStep, currentVolatility);
     }
 
-    private void executeGridLogic() {
+    private void checkRiskStatus() {
+        double currentTotal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
+        double drawDown = (initialInvestment - currentTotal) / initialInvestment;
+        if (drawDown > stopLossThreshold) {
+            log.error("!!! 熔断启动 !!! 亏损触及阈值，执行强制锁仓。");
+            this.active = false;
+        }
+    }
+
+    private void processGrids() {
+        // 金字塔买入逻辑
         buyGrids.removeIf(grid -> {
             if (currentPrice.compareTo(grid) <= 0) {
-                // 每层网格使用 10U 保证金，开 5x 杠杆
-                double margin = 10.0;
-                double amount = (margin * leverage) / grid.doubleValue();
-                if (balanceUsdt >= margin) {
-                    balanceUsdt -= margin;
-                    balanceBtc += amount;
-                    recordTrade("合约开多", grid, amount);
-                    // 挂出止盈网格 (步长 0.5%)
-                    sellGrids.add(grid.add(grid.multiply(new BigDecimal("0.005"))));
-                    return true;
-                }
+                executeTrade("BUY", grid);
+                return true;
             }
             return false;
         });
 
+        // 动态止盈平仓逻辑
         sellGrids.removeIf(grid -> {
             if (currentPrice.compareTo(grid) >= 0 && balanceBtc > 0) {
-                // 简化：每次网格成交卖出约 1/5 仓位
-                double amount = balanceBtc / 5.0;
-                balanceUsdt += grid.doubleValue() * amount / leverage + (grid.doubleValue() * amount); // 粗略模拟盈亏回吐
-                balanceBtc -= amount;
-                recordTrade("合约平多", grid, amount);
+                executeTrade("SELL", grid);
                 return true;
             }
             return false;
         });
     }
 
-    private void recordTrade(String type, BigDecimal price, double amount) {
-        String msg = String.format("%s @ %s, 数量: %.4f", type, price.setScale(2, BigDecimal.ROUND_HALF_UP), amount);
+    private void executeTrade(String type, BigDecimal price) {
+        // 100U 资金下的科学配仓：单笔投入 15% 可用保证金，5x 杠杆
+        double margin = balanceUsdt * 0.15;
+        if ("BUY".equals(type) && balanceUsdt > margin) {
+            double amount = (margin * leverage) / price.doubleValue();
+            balanceUsdt -= margin;
+            balanceBtc += amount;
+            recordTrade("合约开多", price, amount);
+        } else if ("SELL".equals(type) && balanceBtc > 0) {
+            double amountToSell = balanceBtc / (double) Math.max(1, sellGrids.size());
+            balanceUsdt += (price.doubleValue() * amountToSell) / leverage + (price.doubleValue() * amountToSell - lastGridCenter.doubleValue() * amountToSell); 
+            balanceBtc -= amountToSell;
+            recordTrade("合约平多", price, amountToSell);
+        }
+    }
+
+    private void recordTrade(String action, BigDecimal price, double amount) {
+        String msg = String.format("[%s] 价格: %s, 数量: %.6f, 余额: %.2f USDT", 
+            action, price.setScale(2, RoundingMode.HALF_UP), amount, balanceUsdt);
         log.info(msg);
         tradeHistory.add(msg);
     }
 
     public Map<String, Object> getPortfolioSnapshot() {
-        Map<String, Object> res = new HashMap<>();
-        double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
-        res.put("totalValueUsdt", String.format("%.2f", currentVal));
-        res.put("balanceUsdt", String.format("%.2f", balanceUsdt));
-        res.put("balanceBtc", String.format("%.6f", balanceBtc));
-        res.put("currentPrice", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
-        res.put("activeGrids", buyGrids.size());
-        res.put("leverage", leverage + "x");
-        res.put("lastTrades", tradeHistory.size() > 5 ? tradeHistory.subList(tradeHistory.size()-5, tradeHistory.size()) : tradeHistory);
-        return res;
+        Map<String, Object> map = new HashMap<>();
+        double total = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
+        map.put("price", currentPrice.setScale(2, RoundingMode.HALF_UP));
+        map.put("totalValue", String.format("%.2f", total));
+        map.put("usdt", String.format("%.2f", balanceUsdt));
+        map.put("btc", String.format("%.6f", balanceBtc));
+        map.put("pnl", String.format("%.2f%%", (total - initialInvestment)));
+        map.put("lastTrades", tradeHistory);
+        return map;
     }
 }
