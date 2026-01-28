@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 
 @Service
 public class GridStrategyEngine {
@@ -28,40 +30,39 @@ public class GridStrategyEngine {
     private List<BigDecimal> sellGrids = new ArrayList<>();
     private List<String> tradeHistory = new ArrayList<>();
 
-    private double balanceUsdt = 5000;
-    private double balanceBtc = 0.05;
-    private double initialInvestment = 10000;
-    private double stopLossThreshold = 0.05;
+    // 初始模拟资金调优为 100 USDT (开启 5x 杠杆模拟)
+    private double balanceUsdt = 100;
+    private double balanceBtc = 0;
+    private double initialInvestment = 100;
+    private double leverage = 5.0; 
+    private double stopLossThreshold = 0.10; // 模拟合约模式止损
 
-    @Scheduled(fixedRate = 10000) // 每 10s 进行一次多维度扫描
+    @Scheduled(fixedRate = 10000)
     public void runStrategy() {
-        // 1. 获取币安实价
         BigDecimal realPrice = binanceService.getLatestPrice("BTCUSDT");
         if (realPrice != null) currentPrice = realPrice;
 
-        // 2. 宏观与波动率分析
         double vol4h = analyzer.calculateVolatility("BTCUSDT", "4h", 20);
-        String flow = analyzer.getGlobalCapitalFlow();
-
-        if (!active) {
-            log.info("系统初始化：4H波动率={}, 资金流向={}", String.format("%.4f", vol4h), flow);
+        
+        if (!active && tradeHistory.isEmpty()) {
             autoAlignGrids(vol4h);
             active = true;
         }
 
-        // 3. 止损检查
+        if (!active) return;
+
+        // 止损检查
         double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
         if ((initialInvestment - currentVal) / initialInvestment > stopLossThreshold) {
-            log.error("!!! 触发止损 !!! 停止所有逻辑。");
+            log.error("!!! 触发止损 !!! 保证金不足或趋势严重破位，停止运行。");
             active = false;
             return;
         }
 
-        // 4. 自适应重布网：如果偏离度 > 波动率的两倍，则重置
+        // 漂移对齐
         BigDecimal deviation = currentPrice.subtract(lastGridCenter).abs()
                                 .divide(lastGridCenter, 4, BigDecimal.ROUND_HALF_UP);
         if (deviation.doubleValue() > vol4h * 1.5) {
-            log.info("检测到行情漂移，基于最新波动率 {} 自动对齐...", vol4h);
             autoAlignGrids(vol4h);
         }
 
@@ -72,27 +73,27 @@ public class GridStrategyEngine {
         lastGridCenter = currentPrice;
         buyGrids.clear();
         sellGrids.clear();
-        
-        // 动态间距逻辑：基础间距 = 波动率 / 4
         double baseStep = Math.max(0.003, volatility / 4);
-        
         for (int i = 1; i <= 5; i++) {
             double offset = baseStep * Math.pow(1.3, i - 1);
             buyGrids.add(currentPrice.subtract(currentPrice.multiply(new BigDecimal(offset))));
             sellGrids.add(currentPrice.add(currentPrice.multiply(new BigDecimal(offset))));
         }
-        log.info("网格自适应完成：中轴={}, 基础步长={}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP), String.format("%.4f", baseStep));
+        log.info("杠杆网格重置：中轴={}, 步长={}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP), String.format("%.4f", baseStep));
     }
 
     private void executeGridLogic() {
         buyGrids.removeIf(grid -> {
             if (currentPrice.compareTo(grid) <= 0) {
-                double amount = 0.01 * (1 + (5 - buyGrids.size()) * 0.2); 
-                double cost = grid.doubleValue() * amount;
-                if (balanceUsdt >= cost) {
-                    balanceUsdt -= cost;
+                // 每层网格使用 10U 保证金，开 5x 杠杆
+                double margin = 10.0;
+                double amount = (margin * leverage) / grid.doubleValue();
+                if (balanceUsdt >= margin) {
+                    balanceUsdt -= margin;
                     balanceBtc += amount;
-                    recordTrade("买入", grid, amount);
+                    recordTrade("合约开多", grid, amount);
+                    // 挂出止盈网格 (步长 0.5%)
+                    sellGrids.add(grid.add(grid.multiply(new BigDecimal("0.005"))));
                     return true;
                 }
             }
@@ -100,11 +101,12 @@ public class GridStrategyEngine {
         });
 
         sellGrids.removeIf(grid -> {
-            if (currentPrice.compareTo(grid) >= 0 && balanceBtc >= 0.01) {
-                double amount = 0.01;
-                balanceUsdt += grid.doubleValue() * amount;
+            if (currentPrice.compareTo(grid) >= 0 && balanceBtc > 0) {
+                // 简化：每次网格成交卖出约 1/5 仓位
+                double amount = balanceBtc / 5.0;
+                balanceUsdt += grid.doubleValue() * amount / leverage + (grid.doubleValue() * amount); // 粗略模拟盈亏回吐
                 balanceBtc -= amount;
-                recordTrade("卖出", grid, amount);
+                recordTrade("合约平多", grid, amount);
                 return true;
             }
             return false;
@@ -112,15 +114,20 @@ public class GridStrategyEngine {
     }
 
     private void recordTrade(String type, BigDecimal price, double amount) {
-        String msg = String.format("自动成交[%s] @ %s, 数量: %.4f", type, price.setScale(2, BigDecimal.ROUND_HALF_UP), amount);
+        String msg = String.format("%s @ %s, 数量: %.4f", type, price.setScale(2, BigDecimal.ROUND_HALF_UP), amount);
         log.info(msg);
         tradeHistory.add(msg);
     }
 
-    public java.util.Map<String, Object> getPortfolioSnapshot() {
-        java.util.Map<String, Object> res = new java.util.HashMap<>();
-        res.put("totalValueUsdt", String.format("%.2f", balanceUsdt + (balanceBtc * currentPrice.doubleValue())));
-        res.put("balanceBtc", String.format("%.4f", balanceBtc));
+    public Map<String, Object> getPortfolioSnapshot() {
+        Map<String, Object> res = new HashMap<>();
+        double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
+        res.put("totalValueUsdt", String.format("%.2f", currentVal));
+        res.put("balanceUsdt", String.format("%.2f", balanceUsdt));
+        res.put("balanceBtc", String.format("%.6f", balanceBtc));
+        res.put("currentPrice", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+        res.put("activeGrids", buyGrids.size());
+        res.put("leverage", leverage + "x");
         res.put("lastTrades", tradeHistory.size() > 5 ? tradeHistory.subList(tradeHistory.size()-5, tradeHistory.size()) : tradeHistory);
         return res;
     }
