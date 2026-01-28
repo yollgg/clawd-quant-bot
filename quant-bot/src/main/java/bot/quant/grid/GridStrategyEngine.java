@@ -18,6 +18,9 @@ public class GridStrategyEngine {
     @Autowired
     private SentimentService sentimentService;
 
+    @Autowired
+    private BinanceService binanceService;
+
     private BigDecimal currentPrice = new BigDecimal("95759");
     private BigDecimal lastGridCenter = new BigDecimal("95759");
     private boolean active = false;
@@ -47,7 +50,14 @@ public class GridStrategyEngine {
 
     @Scheduled(fixedRate = 5000)
     public void runStrategy() {
-        simulatePriceMovement();
+        BigDecimal realPrice = binanceService.getLatestPrice("BTCUSDT");
+        if (realPrice != null) {
+            currentPrice = realPrice;
+            log.info("[市场实价] BTC/USDT: {}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+        } else {
+            simulatePriceMovement();
+            log.info("[模拟行情] 无法连接 API，使用模拟价格: {}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+        }
 
         if (!active) {
             autoAlignGrids();
