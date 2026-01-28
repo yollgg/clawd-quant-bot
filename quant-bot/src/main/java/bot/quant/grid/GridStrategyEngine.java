@@ -16,121 +16,83 @@ public class GridStrategyEngine {
     private static final Logger log = LoggerFactory.getLogger(GridStrategyEngine.class);
 
     @Autowired
-    private SentimentService sentimentService;
+    private MarketAnalyzer analyzer;
 
     @Autowired
     private BinanceService binanceService;
 
-    private BigDecimal currentPrice = new BigDecimal("90060.25");
-    private BigDecimal lastGridCenter = new BigDecimal("90060.25");
+    private BigDecimal currentPrice = new BigDecimal("90000");
+    private BigDecimal lastGridCenter = new BigDecimal("90000");
     private boolean active = false;
     private List<BigDecimal> buyGrids = new ArrayList<>();
     private List<BigDecimal> sellGrids = new ArrayList<>();
     private List<String> tradeHistory = new ArrayList<>();
 
-    // 初始模拟资金
     private double balanceUsdt = 5000;
-    private double balanceBtc = 0.0522;
+    private double balanceBtc = 0.05;
     private double initialInvestment = 10000;
-    private double stopLossThreshold = 0.05; // 5% 止损阈值
+    private double stopLossThreshold = 0.05;
 
-    public java.util.Map<String, Object> getPortfolioSnapshot() {
-        double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
-        double pnl = currentVal - initialInvestment;
-        double pnlPercentage = (pnl / initialInvestment);
-        
-        java.util.Map<String, Object> snapshot = new java.util.HashMap<>();
-        snapshot.put("currentPrice", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
-        snapshot.put("balanceUsdt", String.format("%.2f", balanceUsdt));
-        snapshot.put("balanceBtc", String.format("%.4f", balanceBtc));
-        snapshot.put("totalValueUsdt", String.format("%.2f", currentVal));
-        snapshot.put("pnlUsdt", String.format("%.2f", pnl));
-        snapshot.put("pnlPercentage", String.format("%.2f%%", pnlPercentage * 100));
-        snapshot.put("activeGrids", buyGrids.size() + sellGrids.size());
-        snapshot.put("status", active ? "RUNNING" : "STOPPED_BY_LIMIT");
-        snapshot.put("lastTrades", tradeHistory.size() > 5 ? tradeHistory.subList(tradeHistory.size()-5, tradeHistory.size()) : tradeHistory);
-        return snapshot;
-    }
-
-    @Scheduled(fixedRate = 5000)
+    @Scheduled(fixedRate = 10000) // 每 10s 进行一次多维度扫描
     public void runStrategy() {
+        // 1. 获取币安实价
         BigDecimal realPrice = binanceService.getLatestPrice("BTCUSDT");
-        if (realPrice != null) {
-            currentPrice = realPrice;
-        } else {
-            simulatePriceMovement();
-        }
+        if (realPrice != null) currentPrice = realPrice;
 
-        if (!active && tradeHistory.isEmpty()) {
-            autoAlignGrids();
+        // 2. 宏观与波动率分析
+        double vol4h = analyzer.calculateVolatility("BTCUSDT", "4h", 20);
+        String flow = analyzer.getGlobalCapitalFlow();
+
+        if (!active) {
+            log.info("系统初始化：4H波动率={}, 资金流向={}", String.format("%.4f", vol4h), flow);
+            autoAlignGrids(vol4h);
             active = true;
-            return;
         }
 
-        if (!active) return;
-
-        // 1. 止损评估机制 (基于总资产)
+        // 3. 止损检查
         double currentVal = balanceUsdt + (balanceBtc * currentPrice.doubleValue());
         if ((initialInvestment - currentVal) / initialInvestment > stopLossThreshold) {
-            log.warn("!!! 触发止损 !!! 当前亏损超过 {}%，停止所有交易。", stopLossThreshold * 100);
+            log.error("!!! 触发止损 !!! 停止所有逻辑。");
             active = false;
             return;
         }
 
-        // 2. 动态自适应：偏离网格中心超过 2% 自动重布网
+        // 4. 自适应重布网：如果偏离度 > 波动率的两倍，则重置
         BigDecimal deviation = currentPrice.subtract(lastGridCenter).abs()
                                 .divide(lastGridCenter, 4, BigDecimal.ROUND_HALF_UP);
-        if (deviation.compareTo(new BigDecimal("0.02")) > 0) {
-            log.info("检测到价格偏离超过 2%，执行金字塔分布重布网...");
-            autoAlignGrids();
+        if (deviation.doubleValue() > vol4h * 1.5) {
+            log.info("检测到行情漂移，基于最新波动率 {} 自动对齐...", vol4h);
+            autoAlignGrids(vol4h);
         }
 
-        executeGridLongLogic();
+        executeGridLogic();
     }
 
-    private void autoAlignGrids() {
-        log.info("--- 策略对齐/更新: {} ---", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+    private void autoAlignGrids(double volatility) {
         lastGridCenter = currentPrice;
-        setupPyramidGrids(currentPrice);
-    }
-
-    private void setupPyramidGrids(BigDecimal centerPrice) {
         buyGrids.clear();
         sellGrids.clear();
         
-        // 3. 金字塔分布：间距采用非线性增长 (类似高斯思路)
+        // 动态间距逻辑：基础间距 = 波动率 / 4
+        double baseStep = Math.max(0.003, volatility / 4);
+        
         for (int i = 1; i <= 5; i++) {
-            double offsetFactor = 0.005 * Math.pow(1.5, i-1);
-            BigDecimal buyLevel = centerPrice.subtract(centerPrice.multiply(new BigDecimal(offsetFactor)));
-            BigDecimal sellLevel = centerPrice.add(centerPrice.multiply(new BigDecimal(offsetFactor)));
-            buyGrids.add(buyLevel);
-            sellGrids.add(sellLevel);
+            double offset = baseStep * Math.pow(1.3, i - 1);
+            buyGrids.add(currentPrice.subtract(currentPrice.multiply(new BigDecimal(offset))));
+            sellGrids.add(currentPrice.add(currentPrice.multiply(new BigDecimal(offset))));
         }
-        log.info("金字塔网格布局完成。中轴: {}", centerPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+        log.info("网格自适应完成：中轴={}, 基础步长={}", currentPrice.setScale(2, BigDecimal.ROUND_HALF_UP), String.format("%.4f", baseStep));
     }
 
-    private void simulatePriceMovement() {
-        double change = (Math.random() - 0.5) * 200;
-        currentPrice = currentPrice.add(new BigDecimal(change));
-    }
-
-    private void executeGridLongLogic() {
-        // 4. 仓位管理：金字塔买入，越低买越多
+    private void executeGridLogic() {
         buyGrids.removeIf(grid -> {
             if (currentPrice.compareTo(grid) <= 0) {
-                double baseAmount = 0.01;
-                // 根据剩余网格数计算权重，越低仓位越大
-                double multiplier = 1.0 + (buyGrids.size() * 0.2); 
-                double amountToBuy = baseAmount * multiplier;
-                
-                double cost = grid.doubleValue() * amountToBuy;
+                double amount = 0.01 * (1 + (5 - buyGrids.size()) * 0.2); 
+                double cost = grid.doubleValue() * amount;
                 if (balanceUsdt >= cost) {
                     balanceUsdt -= cost;
-                    balanceBtc += amountToBuy;
-                    String msg = String.format("金字塔[买入] @ %s, 数量: %.4f", grid.setScale(2, BigDecimal.ROUND_HALF_UP), amountToBuy);
-                    tradeHistory.add(msg);
-                    log.info(msg);
-                    sellGrids.add(grid.add(grid.multiply(new BigDecimal("0.005"))));
+                    balanceBtc += amount;
+                    recordTrade("买入", grid, amount);
                     return true;
                 }
             }
@@ -139,17 +101,27 @@ public class GridStrategyEngine {
 
         sellGrids.removeIf(grid -> {
             if (currentPrice.compareTo(grid) >= 0 && balanceBtc >= 0.01) {
-                double amountToSell = 0.01;
-                double revenue = grid.doubleValue() * amountToSell;
-                balanceUsdt += revenue;
-                balanceBtc -= amountToSell;
-                String msg = String.format("止盈[卖出] @ %s", grid.setScale(2, BigDecimal.ROUND_HALF_UP));
-                tradeHistory.add(msg);
-                log.info(msg);
-                buyGrids.add(grid.subtract(grid.multiply(new BigDecimal("0.005"))));
+                double amount = 0.01;
+                balanceUsdt += grid.doubleValue() * amount;
+                balanceBtc -= amount;
+                recordTrade("卖出", grid, amount);
                 return true;
             }
             return false;
         });
+    }
+
+    private void recordTrade(String type, BigDecimal price, double amount) {
+        String msg = String.format("自动成交[%s] @ %s, 数量: %.4f", type, price.setScale(2, BigDecimal.ROUND_HALF_UP), amount);
+        log.info(msg);
+        tradeHistory.add(msg);
+    }
+
+    public java.util.Map<String, Object> getPortfolioSnapshot() {
+        java.util.Map<String, Object> res = new java.util.HashMap<>();
+        res.put("totalValueUsdt", String.format("%.2f", balanceUsdt + (balanceBtc * currentPrice.doubleValue())));
+        res.put("balanceBtc", String.format("%.4f", balanceBtc));
+        res.put("lastTrades", tradeHistory.size() > 5 ? tradeHistory.subList(tradeHistory.size()-5, tradeHistory.size()) : tradeHistory);
+        return res;
     }
 }
